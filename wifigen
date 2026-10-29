@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+#
+# wifigen - Show which Wi-Fi generation the current connection uses
+# Usage: wifigen [-h|--help] [interface]
+#
+# See README.md or https://github.com/efasel/wifigen  |  MIT License
+#
+
+set -o pipefail
+
+die() { echo "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Usage: wifigen [-h|--help] [interface]
+
+Show which Wi-Fi generation the current connection uses, decoded from iw.
+
+  interface   Wireless interface (default: first one listed by `iw dev`)
+  -h, --help  Show this help
+
+Details: https://github.com/efasel/wifigen
+EOF
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    -*)        usage >&2; exit 1 ;;
+esac
+
+command -v iw >/dev/null || die "iw not found"
+
+iface="${1:-$(iw dev | awk '/Interface/ {print $2; exit}')}"
+[ -n "$iface" ] || die "No wireless interface found"
+
+link="$(iw dev "$iface" link 2>&1)" || die "iw failed: $link"
+grep -q "^Not connected" <<< "$link" && die "Not connected"
+
+field() { awk -v k="$1" '$1 == k":" {print $2; exit}' <<< "$link"; }
+
+bssid=$(awk '/^Connected to/ {print $3; exit}' <<< "$link")
+freq=$(field freq)
+signal=$(field signal)
+rx_line=$(grep "rx bitrate:" <<< "$link")
+tx_line=$(grep "tx bitrate:" <<< "$link")
+
+band_of() {
+    awk -v f="$1" 'BEGIN {
+        if (f == "")       print "unknown"
+        else if (f < 2500) print "2.4 GHz"
+        else if (f < 5925) print "5 GHz"
+        else               print "6 GHz"
+    }'
+}
+
+band=$(band_of "$freq")
+
+# Wi-Fi generation from a bitrate line: 7, 6, 5, 4, or 0 (legacy/unknown)
+generation_of() {
+    case "$1" in
+        *EHT-MCS*) echo 7 ;;
+        *HE-MCS*)  echo 6 ;;
+        *VHT-MCS*) echo 5 ;;
+        *" MCS "*) echo 4 ;;
+        *)         echo 0 ;;
+    esac
+}
+
+generation_name() {
+    case "$1" in
+        7) echo "Wi-Fi 7 (802.11be)" ;;
+        6) if [ "$band" = "6 GHz" ]; then echo "Wi-Fi 6E (802.11ax, 6 GHz)"
+           else echo "Wi-Fi 6 (802.11ax)"; fi ;;
+        5) echo "Wi-Fi 5 (802.11ac)" ;;
+        4) echo "Wi-Fi 4 (802.11n)" ;;
+        *) echo "Legacy (802.11a/b/g)" ;;
+    esac
+}
+
+phy_prefix() {
+    case "$1" in
+        7) echo "EHT-" ;;
+        6) echo "HE-" ;;
+        5) echo "VHT-" ;;
+        *) echo "" ;;
+    esac
+}
+
+rate_of()  { grep -oE '[0-9]+(\.[0-9]+)? MBit/s' <<< "$1" | head -1; }
+
+# iw omits the width for 20 MHz
+width_of() {
+    local w
+    w=$(grep -oE '[0-9]+(\+[0-9]+)?MHz' <<< "$1" | head -1)
+    echo "${w:-20MHz}"
+}
+
+mcs_of() {
+    local gen=$1 line=$2
+    if [ "$gen" = 4 ]; then
+        grep -oE '(^|[[:space:]])MCS [0-9]+' <<< "$line" | awk '{print $2}'
+    elif [ "$gen" -ge 5 ]; then
+        grep -oE "$(phy_prefix "$gen")MCS [0-9]+" <<< "$line" | awk '{print $2}'
+    fi
+}
+
+# HT encodes the stream count in the MCS index (8 MCS per stream)
+nss_of() {
+    local gen=$1 line=$2 mcs
+    if [ "$gen" = 4 ]; then
+        mcs=$(mcs_of 4 "$line")
+        [ -n "$mcs" ] && echo $(( mcs / 8 + 1 ))
+    elif [ "$gen" -ge 5 ]; then
+        grep -oE "$(phy_prefix "$gen")NSS [0-9]+" <<< "$line" | awk '{print $2}'
+    fi
+}
+
+# >= -55 dBm Excellent, >= -67 Good, >= -75 Fair, else Weak
+signal_quality() {
+    local s=$1
+    [[ "$s" =~ ^-?[0-9]+$ ]] || { echo "Unknown"; return; }
+    if   [ "$s" -ge -55 ]; then echo "Excellent"
+    elif [ "$s" -ge -67 ]; then echo "Good"
+    elif [ "$s" -ge -75 ]; then echo "Fair"
+    else                        echo "Weak"
+    fi
+}
+
+join_by_comma() {
+    local s
+    printf -v s '%s, ' "$@"
+    echo "${s%, }"
+}
+
+rx_gen=$(generation_of "$rx_line")
+tx_gen=$(generation_of "$tx_line")
+
+echo "=== Link ($iface) ==="
+grep -E "Connected|SSID|freq|signal|bitrate" <<< "$link"
+echo
+
+echo "=== Decoded Connection ==="
+if [ "$rx_gen" = "$tx_gen" ]; then
+    printf '%-15s: %s\n' "Wi-Fi Version" "$(generation_name "$rx_gen")"
+else
+    printf '%-15s: RX %s / TX %s\n' "Wi-Fi Version" \
+        "$(generation_name "$rx_gen")" "$(generation_name "$tx_gen")"
+fi
+printf '%-15s: %s\n' "Band" "$band${freq:+ (${freq%.*} MHz)}"
+printf '%-15s: %s\n' "Signal" "${signal:-unknown}${signal:+ dBm}"
+printf '%-15s: %s\n' "Signal Quality" "$(signal_quality "$signal")"
+echo
+printf '%-15s  %-16s %s\n' ""              "RX"                          "TX"
+printf '%-15s: %-16s %s\n' "PHY Rate"      "$(rate_of "$rx_line")"       "$(rate_of "$tx_line")"
+printf '%-15s: %-16s %s\n' "Channel Width" "$(width_of "$rx_line")"      "$(width_of "$tx_line")"
+printf '%-15s: %-16s %s\n' "Streams (NSS)" "$(nss_of "$rx_gen" "$rx_line")" "$(nss_of "$tx_gen" "$tx_line")"
+printf '%-15s: %-16s %s\n' "MCS"           "$(mcs_of "$rx_gen" "$rx_line")" "$(mcs_of "$tx_gen" "$tx_line")"
+echo
+
+# AP capabilities: prefer cached scan (no root), fall back to a fresh scan
+bss_block() {
+    awk -v b="$bssid" '
+        /^BSS / { p = index(tolower($2), tolower(b)) == 1 }
+        p
+    '
+}
+
+[ -n "$bssid" ] || exit 0
+
+scan=$(iw dev "$iface" scan dump 2>/dev/null | bss_block)
+if [ -z "$scan" ]; then
+    scan=$(sudo iw dev "$iface" scan 2>/dev/null | bss_block)
+fi
+
+echo "=== Access Point Capabilities ($band) ==="
+offers=()
+grep -qE '^\s*HT capabilities'  <<< "$scan" && offers+=("Wi-Fi 4 (802.11n)")
+grep -qE '^\s*VHT capabilities' <<< "$scan" && offers+=("Wi-Fi 5 (802.11ac)")
+grep -qE '^\s*HE capabilities'  <<< "$scan" && offers+=("Wi-Fi 6 (802.11ax)")
+grep -qE '^\s*EHT capabilities' <<< "$scan" && offers+=("Wi-Fi 7 (802.11be)")
+
+if [ ${#offers[@]} -gt 0 ]; then
+    printf '%-15s: %s\n' "Offers" "$(join_by_comma "${offers[@]}")"
+else
+    printf '%-15s: %s\n' "Offers" "Unknown (BSS not found in scan)"
+fi
+
+if [ "$band" = "6 GHz" ]; then
+    echo "Note           : 6 GHz has no HT/VHT; capabilities shown are for this band only."
+fi
