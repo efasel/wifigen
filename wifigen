@@ -161,7 +161,7 @@ printf '%-15s: %-16s %s\n' "MCS"           "$(mcs_of "$rx_gen" "$rx_line")" "$(m
 echo
 
 # One tab-separated record per BSS in the kernel scan cache:
-# bssid, freq (MHz), signal (dBm), ssid, offered Wi-Fi generations
+# bssid, freq (MHz), signal (dBm), ssid, offered Wi-Fi generations, last seen (ms)
 scan_records() {
     iw dev "$iface" scan dump 2>/dev/null | awk '
         function flush(   gens) {
@@ -170,17 +170,18 @@ scan_records() {
             if (vht) gens = gens ", Wi-Fi 5"
             if (he)  gens = gens (freq >= 5925 ? ", Wi-Fi 6E" : ", Wi-Fi 6")
             if (eht) gens = gens ", Wi-Fi 7"
-            printf "%s\t%d\t%d\t%s\t%s\n", bssid, freq, sig, ssid, substr(gens, 3)
+            printf "%s\t%d\t%d\t%s\t%s\t%d\n", bssid, freq, sig, ssid, substr(gens, 3), seen
         }
         /^BSS / {
             flush()
             bssid = tolower(substr($2, 1, 17))
-            freq = sig = ht = vht = he = eht = 0
+            freq = sig = ht = vht = he = eht = seen = 0
             ssid = ""
             next
         }
         /^\tfreq:/            { freq = $2 }
         /^\tsignal:/          { sig = $2 }
+        /^\tlast seen:/       { seen = $3 }
         /^\tSSID:/            { ssid = substr($0, index($0, ":") + 2) }
         /^\tHT capabilities/  { ht = 1 }
         /^\tVHT capabilities/ { vht = 1 }
@@ -201,20 +202,28 @@ rescan() {
     sudo iw dev "$iface" scan >/dev/null 2>&1
 }
 
-# Cache entries expire ~30 s after last seen, except the associated BSS
-cache_has_other_bss() {
-    awk -F'\t' -v me="$bssid" '$1 != me { found = 1 } END { exit !found }' <<< "$1"
+# Cache entries expire one by one ~30 s after last seen (except the
+# associated BSS), and background scans may be partial. Treat the cache as
+# fresh only if it holds another radio with our SSID and none of those
+# radios is close to expiry.
+MAX_CACHE_AGE_MS=20000
+cache_is_fresh() {
+    awk -F'\t' -v me="$bssid" -v ssid="$ssid" -v max="$MAX_CACHE_AGE_MS" '
+        $1 != me && $4 == ssid { peers++; if ($6 > max) stale = 1 }
+        END { exit !(peers && !stale) }
+    ' <<< "$records"
 }
 
 # Records of radios with our SSID; $1 = "same" (our AP) or "other" (repeaters).
-# Radios of one AP share the last 5 BSSID octets.
+# Radios of one AP share BSSID octets 2-5; vendors vary the first or last octet.
 same_ssid_records() {
-    awk -F'\t' -v ssid="$ssid" -v fam="${bssid:3}" -v want="$1" '
-        $4 == ssid && ((substr($1, 4) == fam) == (want == "same"))
-    ' <<< "$records" | sort -t$'\t' -k1.4,1.17 -k2,2n
+    awk -F'\t' -v ssid="$ssid" -v fam="${bssid:3:11}" -v want="$1" '
+        $4 == ssid && ((substr($1, 4, 11) == fam) == (want == "same"))
+    ' <<< "$records" | sort -t$'\t' -k1.4,1.14 -k2,2n
 }
 
-# Table from records on stdin; $1 = 1 to include the BSSID column
+# Table from records on stdin; $1 = 1 to include the BSSID column.
+# Records are sorted by device, so a blank line separates devices.
 print_bss_table() {
     awk -F'\t' -v me="$bssid" -v show_bssid="$1" "$BAND_AWK"'
         NR == 1 {
@@ -222,6 +231,9 @@ print_bss_table() {
             printf "%-8s %-9s %-8s %s\n", "Band", "Freq", "Signal", "Offers"
         }
         {
+            device = substr($1, 4, 11)
+            if (NR > 1 && device != prev) print ""
+            prev = device
             if (show_bssid) printf "%-18s ", $1
             printf "%-8s %-9s %-8s %s%s\n", band($2), $2 " MHz", $3 " dBm",
                 ($5 == "" ? "Legacy only" : $5), ($1 == me ? "  <- connected" : "")
@@ -232,7 +244,7 @@ print_bss_table() {
 [ -n "$bssid" ] || exit 0
 
 records=$(scan_records)
-if $force_scan || ! cache_has_other_bss "$records"; then
+if $force_scan || ! cache_is_fresh; then
     rescan
     records=$(scan_records)
 fi
