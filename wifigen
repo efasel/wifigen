@@ -12,25 +12,32 @@ die() { echo "$*" >&2; exit 1; }
 
 usage() {
     cat <<'EOF'
-Usage: wifigen [-h|--help] [interface]
+Usage: wifigen [-h|--help] [-s|--scan] [interface]
 
 Show which Wi-Fi generation the current connection uses, decoded from iw.
 
   interface   Wireless interface (default: first one listed by `iw dev`)
+  -s, --scan  Force a fresh scan for access points (~8 s)
   -h, --help  Show this help
 
 Details: https://github.com/efasel/wifigen
 EOF
 }
 
-case "${1:-}" in
-    -h|--help) usage; exit 0 ;;
-    -*)        usage >&2; exit 1 ;;
-esac
+force_scan=false
+iface=""
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) usage; exit 0 ;;
+        -s|--scan) force_scan=true ;;
+        -*)        usage >&2; exit 1 ;;
+        *)         iface="$arg" ;;
+    esac
+done
 
 command -v iw >/dev/null || die "iw not found"
 
-iface="${1:-$(iw dev | awk '/Interface/ {print $2; exit}')}"
+iface="${iface:-$(iw dev | awk '/Interface/ {print $2; exit}')}"
 [ -n "$iface" ] || die "No wireless interface found"
 
 link="$(iw dev "$iface" link 2>&1)" || die "iw failed: $link"
@@ -38,20 +45,22 @@ grep -q "^Not connected" <<< "$link" && die "Not connected"
 
 field() { awk -v k="$1" '$1 == k":" {print $2; exit}' <<< "$link"; }
 
-bssid=$(awk '/^Connected to/ {print $3; exit}' <<< "$link")
+bssid=$(awk '/^Connected to/ {print tolower($3); exit}' <<< "$link")
+ssid=$(awk '$1 == "SSID:" {print substr($0, index($0, ":") + 2); exit}' <<< "$link")
 freq=$(field freq)
 signal=$(field signal)
 rx_line=$(grep "rx bitrate:" <<< "$link")
 tx_line=$(grep "tx bitrate:" <<< "$link")
 
-band_of() {
-    awk -v f="$1" 'BEGIN {
-        if (f == "")       print "unknown"
-        else if (f < 2500) print "2.4 GHz"
-        else if (f < 5925) print "5 GHz"
-        else               print "6 GHz"
-    }'
-}
+# Shared awk helper: band name from frequency in MHz
+BAND_AWK='function band(f) {
+    if (f == "")  return "unknown"
+    if (f < 2500) return "2.4 GHz"
+    if (f < 5925) return "5 GHz"
+    return "6 GHz"
+}'
+
+band_of() { awk -v f="$1" "$BAND_AWK"' BEGIN { print band(f) }'; }
 
 band=$(band_of "$freq")
 
@@ -126,12 +135,6 @@ signal_quality() {
     fi
 }
 
-join_by_comma() {
-    local s
-    printf -v s '%s, ' "$@"
-    echo "${s%, }"
-}
-
 rx_gen=$(generation_of "$rx_line")
 tx_gen=$(generation_of "$tx_line")
 
@@ -157,34 +160,101 @@ printf '%-15s: %-16s %s\n' "Streams (NSS)" "$(nss_of "$rx_gen" "$rx_line")" "$(n
 printf '%-15s: %-16s %s\n' "MCS"           "$(mcs_of "$rx_gen" "$rx_line")" "$(mcs_of "$tx_gen" "$tx_line")"
 echo
 
-# AP capabilities: prefer cached scan (no root), fall back to a fresh scan
-bss_block() {
-    awk -v b="$bssid" '
-        /^BSS / { p = index(tolower($2), tolower(b)) == 1 }
-        p
+# One tab-separated record per BSS in the kernel scan cache:
+# bssid, freq (MHz), signal (dBm), ssid, offered Wi-Fi generations
+scan_records() {
+    iw dev "$iface" scan dump 2>/dev/null | awk '
+        function flush(   gens) {
+            if (bssid == "") return
+            if (ht)  gens = gens ", Wi-Fi 4"
+            if (vht) gens = gens ", Wi-Fi 5"
+            if (he)  gens = gens (freq >= 5925 ? ", Wi-Fi 6E" : ", Wi-Fi 6")
+            if (eht) gens = gens ", Wi-Fi 7"
+            printf "%s\t%d\t%d\t%s\t%s\n", bssid, freq, sig, ssid, substr(gens, 3)
+        }
+        /^BSS / {
+            flush()
+            bssid = tolower(substr($2, 1, 17))
+            freq = sig = ht = vht = he = eht = 0
+            ssid = ""
+            next
+        }
+        /^\tfreq:/            { freq = $2 }
+        /^\tsignal:/          { sig = $2 }
+        /^\tSSID:/            { ssid = substr($0, index($0, ":") + 2) }
+        /^\tHT capabilities/  { ht = 1 }
+        /^\tVHT capabilities/ { vht = 1 }
+        /^\tHE capabilities/  { he = 1 }
+        /^\tEHT capabilities/ { eht = 1 }
+        END { flush() }
+    '
+}
+
+# Prefer NetworkManager (no root via polkit), fall back to sudo iw
+rescan() {
+    if command -v nmcli >/dev/null; then
+        echo "Scanning for access points via NetworkManager (~8 s)..." >&2
+        nmcli -f BSSID dev wifi list ifname "$iface" --rescan yes \
+            >/dev/null 2>&1 && return
+    fi
+    echo "Scanning for access points via sudo iw..." >&2
+    sudo iw dev "$iface" scan >/dev/null 2>&1
+}
+
+# Cache entries expire ~30 s after last seen, except the associated BSS
+cache_has_other_bss() {
+    awk -F'\t' -v me="$bssid" '$1 != me { found = 1 } END { exit !found }' <<< "$1"
+}
+
+# Records of radios with our SSID; $1 = "same" (our AP) or "other" (repeaters).
+# Radios of one AP share the last 5 BSSID octets.
+same_ssid_records() {
+    awk -F'\t' -v ssid="$ssid" -v fam="${bssid:3}" -v want="$1" '
+        $4 == ssid && ((substr($1, 4) == fam) == (want == "same"))
+    ' <<< "$records" | sort -t$'\t' -k1.4,1.17 -k2,2n
+}
+
+# Table from records on stdin; $1 = 1 to include the BSSID column
+print_bss_table() {
+    awk -F'\t' -v me="$bssid" -v show_bssid="$1" "$BAND_AWK"'
+        NR == 1 {
+            if (show_bssid) printf "%-18s ", "BSSID"
+            printf "%-8s %-9s %-8s %s\n", "Band", "Freq", "Signal", "Offers"
+        }
+        {
+            if (show_bssid) printf "%-18s ", $1
+            printf "%-8s %-9s %-8s %s%s\n", band($2), $2 " MHz", $3 " dBm",
+                ($5 == "" ? "Legacy only" : $5), ($1 == me ? "  <- connected" : "")
+        }
     '
 }
 
 [ -n "$bssid" ] || exit 0
 
-scan=$(iw dev "$iface" scan dump 2>/dev/null | bss_block)
-if [ -z "$scan" ]; then
-    scan=$(sudo iw dev "$iface" scan 2>/dev/null | bss_block)
+records=$(scan_records)
+if $force_scan || ! cache_has_other_bss "$records"; then
+    rescan
+    records=$(scan_records)
 fi
 
-echo "=== Access Point Capabilities ($band) ==="
-offers=()
-grep -qE '^\s*HT capabilities'  <<< "$scan" && offers+=("Wi-Fi 4 (802.11n)")
-grep -qE '^\s*VHT capabilities' <<< "$scan" && offers+=("Wi-Fi 5 (802.11ac)")
-grep -qE '^\s*HE capabilities'  <<< "$scan" && offers+=("Wi-Fi 6 (802.11ax)")
-grep -qE '^\s*EHT capabilities' <<< "$scan" && offers+=("Wi-Fi 7 (802.11be)")
-
-if [ ${#offers[@]} -gt 0 ]; then
-    printf '%-15s: %s\n' "Offers" "$(join_by_comma "${offers[@]}")"
+echo "=== Access Point Capabilities ==="
+ap=$(same_ssid_records same)
+if [ -n "$ap" ]; then
+    print_bss_table 0 <<< "$ap"
+    if awk -F'\t' '$2 < 2500 && $5 ~ /Wi-Fi 5/ { f = 1 } END { exit !f }' <<< "$ap"; then
+        echo "Note: Wi-Fi 5 on 2.4 GHz is a vendor extension (256-QAM), not 802.11ac."
+    fi
 else
-    printf '%-15s: %s\n' "Offers" "Unknown (BSS not found in scan)"
+    echo "Unknown (AP not found in scan)"
 fi
 
-if [ "$band" = "6 GHz" ]; then
-    echo "Note           : 6 GHz has no HT/VHT; capabilities shown are for this band only."
+[ -n "$ssid" ] || exit 0
+
+echo
+echo "=== Other APs named \"$ssid\" (mesh repeaters?) ==="
+others=$(same_ssid_records other)
+if [ -n "$others" ]; then
+    print_bss_table 1 <<< "$others"
+else
+    echo "None found"
 fi

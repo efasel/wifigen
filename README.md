@@ -29,15 +29,23 @@ Channel Width  : 160MHz           160MHz
 Streams (NSS)  : 2                2
 MCS            : 7                8
 
-=== Access Point Capabilities (6 GHz) ===
-Offers         : Wi-Fi 6 (802.11ax)
-Note           : 6 GHz has no HT/VHT; capabilities shown are for this band only.
+=== Access Point Capabilities ===
+Band     Freq      Signal   Offers
+2.4 GHz  2412 MHz  -43 dBm  Wi-Fi 4, Wi-Fi 5, Wi-Fi 6
+5 GHz    5180 MHz  -51 dBm  Wi-Fi 4, Wi-Fi 5, Wi-Fi 6
+6 GHz    5975 MHz  -50 dBm  Wi-Fi 6E  <- connected
+Note: Wi-Fi 5 on 2.4 GHz is a vendor extension (256-QAM), not 802.11ac.
+
+=== Other APs named "MyNetwork" (mesh repeaters?) ===
+BSSID              Band     Freq      Signal   Offers
+02:00:00:00:00:02  5 GHz    5500 MHz  -80 dBm  Wi-Fi 4, Wi-Fi 5
 ```
 
 ## Requirements
 
 - Linux with `bash`, `iw`, `awk`, `grep`
-- `sudo` only if the AP is not in the scan cache
+- NetworkManager (`nmcli`) for scanning without root; otherwise `sudo iw` is
+  used when a scan is needed
 
 ## Installation
 
@@ -51,6 +59,7 @@ ln -s "$PWD/wifigen/wifigen" ~/bin/wifigen   # any directory on your PATH
 ```sh
 wifigen              # auto-detects the wireless interface
 wifigen wlp2s0       # explicit interface
+wifigen --scan       # force a fresh scan for access points (~8 s)
 wifigen --help       # show usage
 ```
 
@@ -71,7 +80,10 @@ no interface is found, `iw` fails, or you are not connected.
 - **Channel width** defaults to 20 MHz when `iw` omits it
 - **Signal quality**: ≥ -55 dBm Excellent, ≥ -67 Good, ≥ -75 Fair, else Weak
 - **AP capabilities** come from the HT/VHT/HE/EHT capability elements in the
-  scan cache (see below); a fresh `sudo iw scan` is the fallback
+  scan cache (see below)
+- **Same AP, other bands**: radios with the same SSID whose BSSID matches in
+  the last 5 octets (vendors typically vary only the first octet per band)
+- **Other APs**: same SSID, different BSSID family, typically mesh repeaters
 
 ## Scan cache
 
@@ -82,10 +94,15 @@ recently seen access points. Nothing is stored on disk.
   beacons from the associated AP.
 - **Expires** entries ~30 s after an AP was last seen, except the associated
   AP, which is always kept.
-- **No root needed** to read it; triggering a fresh scan needs `CAP_NET_ADMIN`,
-  hence the `sudo` fallback (rarely used, since the associated AP is kept).
+- **No root needed** to read it.
 - **Freshness**: capabilities reflect the AP's last beacon or probe response.
   These rarely change, so the cached data is reliable.
+
+If the cache holds nothing but the associated AP (or `--scan` is given),
+wifigen triggers a fresh scan and says so on stderr. It uses
+`nmcli dev wifi list --rescan yes`, which needs no root (polkit) but takes
+~8 s, and falls back to `sudo iw dev <if> scan`. Running wifigen again within
+~30 s uses the warm cache and is instant.
 
 Inspect it yourself:
 
@@ -95,10 +112,14 @@ iw dev wlp2s0 scan dump | grep -E '^BSS|SSID:|freq:|last seen'
 
 ## Notes
 
-- On 6 GHz, access points do not advertise HT/VHT, so only Wi-Fi 6/7 can show.
-  The AP may still offer Wi-Fi 4/5 on its 2.4/5 GHz radios.
+- On 6 GHz, access points do not advertise HT/VHT, so only Wi-Fi 6E/7 can show
+  on that band.
+- Some APs advertise VHT on 2.4 GHz (a vendor extension for 256-QAM), so
+  Wi-Fi 5 may appear there.
 - A lower negotiated version than the AP offers usually means you are connected
   through a mesh repeater, or your client or band does not support it.
+- A fresh scan briefly takes the radio off-channel; expect a short latency
+  blip on the active connection.
 - Rates shown are PHY (link) rates, not real throughput.
 
 ## License
